@@ -1,0 +1,444 @@
+---
+title: "Old Chicago Main Post Office: Difference-in-Differences Analysis"
+author: ""
+date: "April 13, 2026"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_width: 7
+    fig_height: 4
+    fig_caption: true
+    latex_engine: xelatex
+geometry: margin=1in
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+
+required_packages <- c("data.table", "ggplot2", "fixest", "stringr", "here", "scales")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[, "Package"])]
+if (length(new_packages)) install.packages(new_packages)
+
+library(data.table)
+library(ggplot2)
+library(fixest)
+library(stringr)
+library(here)
+library(scales)
+```
+
+```{r file-paths}
+treat_file       <- here("treatment_0_500.csv")
+control_file     <- here("control_800_1300.csv")
+post_office_file <- here("Assessor_-_Assessed_Values_20260401 (1).csv")
+south1_file      <- here("South Chicago_1_Assessed_Values.csv")
+south2_file      <- here("South Chicago_2_Assessed_Values.csv")
+west1_file       <- here("West Chicago_1_Assessed_Values.csv")
+west2_file       <- here("West Chicago_2_Assessed_Values.csv")
+```
+
+```{r load-parcels}
+treat   <- fread(treat_file)
+control <- fread(control_file)
+
+treat   <- treat[,   .(keypin, bldgsf, usedesc)]
+control <- control[, .(keypin, bldgsf, usedesc)]
+
+treat[,   group := "treatment"]
+control[, group := "control"]
+
+sample_parcels <- rbindlist(list(treat, control), fill = TRUE)
+
+sample_parcels[, pin    := str_pad(as.character(keypin), width = 14, pad = "0")]
+sample_parcels[, bldgsf := as.numeric(bldgsf)]
+
+sample_parcels <- sample_parcels[!is.na(bldgsf) & bldgsf > 0]
+sample_parcels <- unique(sample_parcels[, .(pin, bldgsf, usedesc, group)], by = "pin")
+
+dup_pins <- sample_parcels[, .N, by = pin][N > 1]
+if (nrow(dup_pins) > 0) stop("Some PINs appear in both treatment and control groups.")
+```
+
+```{r load-assessor}
+assessor <- rbindlist(list(
+  fread(south1_file), fread(south2_file),
+  fread(west1_file),  fread(west2_file)
+), fill = TRUE)
+
+assessor <- assessor[, .(pin, tax_year, township_name, class, certified_tot)]
+assessor[, pin          := str_pad(as.character(pin), width = 14, pad = "0")]
+assessor[, certified_tot := as.numeric(gsub("[$,]", "", certified_tot))]
+assessor <- assessor[!is.na(certified_tot)]
+
+assessor_small <- assessor[pin %in% sample_parcels$pin]
+
+panel <- merge(assessor_small, sample_parcels, by = "pin", all.x = TRUE)
+panel <- panel[tax_year >= 1999 & tax_year <= 2025]
+panel <- panel[certified_tot > 0]
+```
+
+```{r cpi}
+# CPI-U annual averages, U.S. City Average
+# Source: Bureau of Labor Statistics. Base year: 2025.
+cpi <- data.table(
+  tax_year = 1999:2025,
+  cpi = c(
+    168.400, 173.800, 178.300, 181.200, 184.500,
+    188.600, 194.300, 198.300, 204.818, 212.536,
+    209.995, 212.870, 218.684, 222.005, 224.545,
+    228.468, 227.792, 229.302, 233.611, 237.706,
+    241.181, 243.873, 254.159, 273.356, 282.450,
+    292.225, 301.232
+  )
+)
+
+base_cpi <- cpi[tax_year == 2025, cpi][1]
+
+panel <- merge(panel, cpi, by = "tax_year", all.x = TRUE)
+panel[, real_certified_tot := certified_tot * (base_cpi / cpi)]
+```
+
+```{r value-psf}
+panel[, value_psf := real_certified_tot / bldgsf]
+panel <- panel[!is.na(value_psf) & is.finite(value_psf) & value_psf >= 1]
+
+p99          <- panel[, quantile(value_psf, 0.99, na.rm = TRUE)]
+panel_main   <- panel[value_psf <= p99]
+```
+
+```{r did-setup}
+panel_main[, treatment := ifelse(group == "treatment", 1, 0)]
+panel_main[, post      := ifelse(tax_year >= 2019, 1, 0)]
+
+# Main specification: all years
+did_data_full <- panel_main[value_psf > 0]
+did_data_full[, log_value_psf := log(value_psf)]
+did_data_full[, year_rel      := tax_year - 2019]
+
+# Robustness specification: exclude 2016-2018 transition years
+did_data_clean <- panel_main[!tax_year %in% c(2016, 2017, 2018) & value_psf > 0]
+did_data_clean[, log_value_psf := log(value_psf)]
+did_data_clean[, year_rel      := tax_year - 2019]
+```
+
+```{r theme}
+# Shared plot theme
+theme_po <- function() {
+  theme_minimal(base_size = 11) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 11),
+      plot.subtitle = element_text(size = 9, color = "gray40"),
+      legend.position = "bottom"
+    )
+}
+
+# Shared annotation layers
+vlines <- list(
+  geom_vline(xintercept = 2010, linetype = "dashed", color = "gray50"),
+  geom_vline(xintercept = 2019, linetype = "dashed", color = "black")
+)
+
+transition_band <- annotate(
+  "rect", xmin = 2016, xmax = 2018,
+  ymin = -Inf, ymax = Inf,
+  alpha = 0.15, fill = "gray70"
+)
+```
+
+\newpage
+
+# Post Office Building Value Trajectory
+
+```{r post-office-series}
+post_office_pin    <- "17161300010000"
+post_office_series <- fread(post_office_file)
+
+post_office_series <- post_office_series[, .(pin, tax_year, certified_tot)]
+post_office_series[, pin          := str_pad(as.character(pin), width = 14, pad = "0")]
+post_office_series[, certified_tot := as.numeric(gsub("[$,]", "", certified_tot))]
+post_office_series <- post_office_series[
+  pin == post_office_pin & !is.na(certified_tot)
+][order(tax_year)]
+
+post_office_series <- merge(post_office_series, cpi, by = "tax_year", all.x = TRUE)
+post_office_series[, real_certified_tot := certified_tot * (base_cpi / cpi)]
+```
+
+```{r fig-post-office, fig.cap="Real assessed value of the Old Chicago Main Post Office parcel, 1999-2025. Shaded band marks 2016-2018 transition period."}
+ggplot(post_office_series, aes(x = tax_year, y = real_certified_tot / 1e6)) +
+  transition_band +
+  vlines +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_y_continuous(labels = label_number(accuracy = 1)) +
+  labs(
+    title = "Old Chicago Main Post Office: Real Assessed Value (1999-2025)",
+    subtitle = paste(
+      "Shaded band = 2016-2018 transition years.",
+      "Dashed lines = 2010 baseline and 2019 treatment onset."
+    ),
+    x = "Tax Year",
+    y = "Real assessed value (USD millions, 2025 dollars)"
+  ) +
+  theme_po()
+```
+
+\newpage
+
+# Parallel Trends
+
+## Formal pre-period: 1999-2015
+
+```{r pre-trends-strict}
+pre_trends_strict <- panel_main[tax_year <= 2015][
+  ,
+  .(
+    avg_value_psf     = mean(value_psf, na.rm = TRUE),
+    log_avg_value_psf = log(mean(value_psf, na.rm = TRUE)),
+    n = .N
+  ),
+  by = .(tax_year, group)
+][order(group, tax_year)]
+```
+
+```{r fig-pre-levels, fig.cap="Average real assessed value per sq ft, treatment vs control, 1999-2015. Dashed line marks 2010 baseline."}
+ggplot(pre_trends_strict, aes(x = tax_year, y = avg_value_psf, color = group)) +
+  geom_vline(xintercept = 2010, linetype = "dashed", color = "gray50") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title    = "Pre-Treatment Trends: Real Assessed Value per Sq Ft (1999-2015)",
+    subtitle = "Dashed line marks 2010 baseline",
+    x = "Tax Year",
+    y = "Avg real assessed value per sq ft",
+    color = "Group"
+  ) +
+  theme_po()
+```
+
+```{r fig-pre-logs, fig.cap="Log average real assessed value per sq ft, treatment vs control, 1999-2015."}
+ggplot(pre_trends_strict, aes(x = tax_year, y = log_avg_value_psf, color = group)) +
+  geom_vline(xintercept = 2010, linetype = "dashed", color = "gray50") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title    = "Pre-Treatment Trends: Log Real Assessed Value per Sq Ft (1999-2015)",
+    subtitle = "Dashed line marks 2010 baseline",
+    x = "Tax Year",
+    y = "Log avg real assessed value per sq ft",
+    color = "Group"
+  ) +
+  theme_po()
+```
+
+## Extended pre-period including transition years: 1999-2018
+
+```{r pre-trends-hist}
+pre_trends_hist <- panel_main[tax_year <= 2018][
+  ,
+  .(
+    avg_value_psf     = mean(value_psf, na.rm = TRUE),
+    log_avg_value_psf = log(mean(value_psf, na.rm = TRUE)),
+    n = .N
+  ),
+  by = .(tax_year, group)
+][order(group, tax_year)]
+```
+
+```{r fig-hist-levels, fig.cap="Average real assessed value per sq ft including 2016-2018 transition years. Shaded band marks transition period."}
+ggplot(pre_trends_hist, aes(x = tax_year, y = avg_value_psf, color = group)) +
+  transition_band +
+  geom_vline(xintercept = 2010, linetype = "dashed", color = "gray50") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title    = "Pre-2019 Trends: Real Assessed Value per Sq Ft (1999-2018)",
+    subtitle = paste(
+      "Shaded band = 2016-2018 transition years.",
+      "Dashed line = 2010 baseline."
+    ),
+    x = "Tax Year",
+    y = "Avg real assessed value per sq ft",
+    color = "Group"
+  ) +
+  theme_po()
+```
+
+```{r fig-hist-logs, fig.cap="Log average real assessed value per sq ft including 2016-2018 transition years."}
+ggplot(pre_trends_hist, aes(x = tax_year, y = log_avg_value_psf, color = group)) +
+  transition_band +
+  geom_vline(xintercept = 2010, linetype = "dashed", color = "gray50") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title    = "Pre-2019 Trends: Log Real Assessed Value per Sq Ft (1999-2018)",
+    subtitle = paste(
+      "Shaded band = 2016-2018 transition years.",
+      "Dashed line = 2010 baseline."
+    ),
+    x = "Tax Year",
+    y = "Log avg real assessed value per sq ft",
+    color = "Group"
+  ) +
+  theme_po()
+```
+
+\newpage
+
+# Full-Period Descriptive Trends (1999-2025)
+
+```{r full-trends}
+yearly_means_full <- did_data_full[
+  ,
+  .(
+    avg_value_psf     = mean(value_psf,     na.rm = TRUE),
+    avg_log_value_psf = mean(log_value_psf, na.rm = TRUE),
+    n = .N
+  ),
+  by = .(tax_year, group, treatment)
+][order(group, tax_year)]
+```
+
+```{r fig-full-levels, fig.cap="Full-period average real assessed value per sq ft. Shaded band = 2016-2018 transition years. Dashed lines = 2010 baseline and 2019 treatment onset."}
+ggplot(yearly_means_full, aes(x = tax_year, y = avg_value_psf, color = group)) +
+  transition_band +
+  vlines +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title    = "Treatment vs Control: Real Assessed Value per Sq Ft (1999-2025)",
+    subtitle = paste(
+      "Shaded band = 2016-2018 transition years.",
+      "Dashed lines = 2010 baseline and 2019 treatment onset."
+    ),
+    x = "Tax Year",
+    y = "Avg real assessed value per sq ft",
+    color = "Group"
+  ) +
+  theme_po()
+```
+
+```{r fig-full-logs, fig.cap="Full-period log average real assessed value per sq ft."}
+ggplot(yearly_means_full, aes(x = tax_year, y = avg_log_value_psf, color = group)) +
+  transition_band +
+  vlines +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title    = "Treatment vs Control: Log Real Assessed Value per Sq Ft (1999-2025)",
+    subtitle = paste(
+      "Shaded band = 2016-2018 transition years.",
+      "Dashed lines = 2010 baseline and 2019 treatment onset."
+    ),
+    x = "Tax Year",
+    y = "Log avg real assessed value per sq ft",
+    color = "Group"
+  ) +
+  theme_po()
+```
+
+\newpage
+
+# Difference-in-Differences Results
+
+## Two-Way Fixed Effects Models
+
+```{r did-twfe}
+did_fe_log_full <- feols(
+  log_value_psf ~ treatment:post | pin + tax_year,
+  cluster = ~pin,
+  data    = did_data_full
+)
+
+did_fe_log_clean <- feols(
+  log_value_psf ~ treatment:post | pin + tax_year,
+  cluster = ~pin,
+  data    = did_data_clean
+)
+
+cat("Main specification (all years):\n")
+summary(did_fe_log_full)
+
+cat("\nRobustness check (excluding 2016-2018):\n")
+summary(did_fe_log_clean)
+```
+
+## Coefficient Comparison
+
+```{r model-compare}
+model_compare <- data.table(
+  Specification = c("Main (all years)", "Robustness (excl. 2016-2018)"),
+  Coef  = c(coef(did_fe_log_full)["treatment:post"],
+             coef(did_fe_log_clean)["treatment:post"]),
+  SE    = c(fixest::se(did_fe_log_full)["treatment:post"],
+             fixest::se(did_fe_log_clean)["treatment:post"]),
+  Pval  = c(fixest::pvalue(did_fe_log_full)["treatment:post"],
+             fixest::pvalue(did_fe_log_clean)["treatment:post"]),
+  N     = c(nobs(did_fe_log_full), nobs(did_fe_log_clean))
+)
+
+model_compare[, CI_low  := Coef - 1.96 * SE]
+model_compare[, CI_high := Coef + 1.96 * SE]
+
+cols <- c("Coef", "SE", "CI_low", "CI_high")
+model_compare[, (cols) := lapply(.SD, round, 4), .SDcols = cols]
+model_compare[, Pval := round(Pval, 4)]
+
+print(model_compare)
+```
+
+\newpage
+
+# Event Study
+
+The event study uses the robustness sample (2016-2018 excluded) with year $-4$
+(2015) as the reference period. Pre-period coefficients near zero support the
+parallel trends assumption.
+
+```{r event-study, fig.cap="Event study coefficients for log real assessed value per sq ft. Reference year is 2015 (year -4). Bands show 95% confidence intervals."}
+es_model <- feols(
+  log_value_psf ~ i(year_rel, treatment, ref = -4) | pin + tax_year,
+  cluster = ~pin,
+  data    = did_data_clean
+)
+
+summary(es_model)
+
+iplot(
+  es_model,
+  main      = "Event Study: Log Real Assessed Value per Sq Ft",
+  xlab      = "Years relative to treatment onset (2019)",
+  ylab      = "Coefficient (log points)",
+  col       = "steelblue",
+  zero.line = TRUE
+)
+```
+
+\newpage
+
+# Appendix: OLS Models
+
+Included for reference only. The TWFE results in Section 4 are the preferred
+specification; OLS conflates within- and between-unit variation.
+
+```{r appendix-ols}
+cat("Main specification:\n")
+did_model_level_full <- lm(value_psf    ~ treatment * post, data = did_data_full)
+did_model_log_full   <- lm(log_value_psf ~ treatment * post, data = did_data_full)
+summary(did_model_level_full)
+summary(did_model_log_full)
+
+cat("\nRobustness (excluding 2016-2018):\n")
+did_model_level_clean <- lm(value_psf    ~ treatment * post, data = did_data_clean)
+did_model_log_clean   <- lm(log_value_psf ~ treatment * post, data = did_data_clean)
+summary(did_model_level_clean)
+summary(did_model_log_clean)
+```
