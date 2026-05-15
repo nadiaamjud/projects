@@ -6,11 +6,14 @@ The project focused on validating an existing analysis of non-public school enro
 
 ## Materials Included
 
-- `analysis-spreadsheets/`: Excel workbooks used to compare non-public school enrollment trends across data sources
+- ## Materials Included
+
+- `k12-non-public-enrollment-data-swi-2025.xlsx`: Main Excel workbook containing K–12 non-public enrollment data used in the validation analysis.
+- `historic-report-card-district-data.xlsx`: Excel workbook containing historical ISBE Report Card district data used for comparison and validation.
 
 ## Project Summary
 
-For this project, I cross-referenced multiple datasets to identify discrepancies, confirm data accuracy, and ensure consistency between sources. The goal was to strengthen the reliability of reported enrollment trends by comparing Fall Enrollment Numbers with Census and ISBE Report Card data.
+For this project, I cleaned and cross-referenced multiple datasets to identify discrepancies, confirm data accuracy, and ensure consistency between sources. The goal was to strengthen the reliability of reported enrollment trends by comparing Fall Enrollment Numbers with Census and ISBE Report Card data.
 
 ## Skills Demonstrated
 
